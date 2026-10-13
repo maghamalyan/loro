@@ -38,6 +38,7 @@ fn len_ops_tracks_snapshot_import_while_state_is_locked() {
 }
 
 #[test]
+#[cfg(debug_assertions)] // Lock-order tracking is disabled in release builds.
 fn len_ops_prefers_exact_oplog_value_when_lock_order_allows() {
     let doc = LoroDoc::new_auto_commit();
     doc.set_peer_id(3).unwrap();
