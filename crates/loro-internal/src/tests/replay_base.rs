@@ -614,3 +614,52 @@ fn retained_full_text_tracker_extends_after_local_and_concurrent_edits() {
     }
     assert_eq!(rebuilds, 1);
 }
+
+#[test]
+fn retained_text_tracker_handles_grouped_deletes_marks_and_cache_release() {
+    use crate::{cursor::PosType, diff_calc::FULL_TRACKER_REBUILD_COUNT, undo::UndoManager};
+    let (a, b) = criss_cross(12);
+    let undo = UndoManager::new(&a);
+    let mut rebuilds = 0;
+    for round in 0..24 {
+        if round == 12 {
+            a.free_diff_calculator();
+        }
+        let before = a.state_frontiers();
+        let original = a.get_deep_value();
+        undo.group_start().unwrap();
+        let text = a.get_text("t");
+        text.insert_unicode(0, "😀local").unwrap();
+        a.commit_then_renew();
+        text.delete_unicode(1, 2).unwrap();
+        text.mark(0, 3, "bold", (round % 2 == 0).into(), PosType::Unicode)
+            .unwrap();
+        a.commit_then_renew();
+        undo.group_end();
+        b.get_text("t").insert_unicode(0, "remote").unwrap();
+        b.commit_then_renew();
+        exchange(&a, &b);
+        let expected = a.get_deep_value();
+        let count = FULL_TRACKER_REBUILD_COUNT.with(|c| c.get());
+        assert!(undo.undo().unwrap());
+        let reverted = a.get_deep_value();
+        assert!(undo.redo().unwrap());
+        assert_eq!(a.get_deep_value(), expected);
+        let latest = a.state_frontiers();
+        undo.pause();
+        a.checkout(&before).unwrap();
+        assert_eq!(a.get_deep_value(), original);
+        a.checkout(&latest).unwrap();
+        assert_eq!(a.get_deep_value(), expected);
+        a.attach();
+        undo.resume();
+        rebuilds += FULL_TRACKER_REBUILD_COUNT.with(|c| c.get()) - count;
+        let oracle = LoroDoc::new_auto_commit();
+        oracle
+            .import(&a.export(ExportMode::Snapshot).unwrap())
+            .unwrap();
+        assert_eq!(oracle.get_deep_value(), expected);
+        assert_ne!(reverted, expected);
+    }
+    assert!(rebuilds <= 2, "one build per cache lifetime: {rebuilds}");
+}
