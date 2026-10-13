@@ -43,6 +43,12 @@ use crate::{
     txn::Transaction,
 };
 use either::Either;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_APPLY_DIFF_AFTER_HANDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static AFTER_APPLY_DIFF_HANDLER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 use loro_common::{
     ContainerID, ContainerType, HasCounterSpan, HasIdSpan, HasLamportSpan, IdSpan, LoroEncodeError,
     LoroResult, LoroValue, ID,
@@ -1204,6 +1210,7 @@ impl LoroDoc {
         post_transform_base: Option<&DiffBatch>,
         before_diff: &mut dyn FnMut(&DiffBatch),
     ) -> LoroResult<CommitWhenDrop<'_>> {
+        let _exclusive = self.txn.lock_exclusive();
         if !self.can_edit() {
             return Err(LoroError::EditWhenDetached);
         }
@@ -1222,6 +1229,7 @@ impl LoroDoc {
         };
 
         let spans = self.oplog.lock().split_span_based_on_deps(id_span);
+        let mut inverse_before_transform = None;
         let diff = crate::undo::undo(
             spans,
             match post_transform_base {
@@ -1237,7 +1245,7 @@ impl LoroDoc {
                 state.stop_and_clear_recording();
                 DiffBatch::new(e)
             },
-            before_diff,
+            &mut |diff| inverse_before_transform = Some(diff.clone()),
         );
 
         // println!("\nundo_internal: diff: {:?}", diff);
@@ -1250,15 +1258,14 @@ impl LoroDoc {
         }
         drop(txn);
         self.start_auto_commit();
-        // Try applying the diff, but ignore the error if it happens.
-        // MovableList's undo behavior is too tricky to handle in a collaborative env
-        // so in edge cases this may be an Error
-        if let Err(e) = self._apply_diff(diff, container_remap, true) {
-            warn!("Undo Failed {:?}", e);
-        }
+        let result = self.apply_diff_all_or_nothing(diff, container_remap, true);
 
         if let Some(options) = options {
             self.set_next_commit_options(options);
+        }
+        result?;
+        if let Some(diff) = inverse_before_transform {
+            before_diff(&diff);
         }
         Ok(CommitWhenDrop {
             doc: self,
@@ -1345,6 +1352,172 @@ impl LoroDoc {
         self._apply_diff(diff, &mut Default::default(), true)
     }
 
+    /// Roll back a failed undo batch using upstream #1154's transaction scope.
+    /// The caller holds the exclusive transaction gate throughout the scope.
+    pub(crate) fn apply_diff_all_or_nothing(
+        &self,
+        diff: DiffBatch,
+        container_remap: &mut FxHashMap<ContainerID, ContainerID>,
+        skip_unreachable: bool,
+    ) -> LoroResult<()> {
+        if !self.can_edit() {
+            return Err(LoroError::EditWhenDetached);
+        }
+
+        let remap_before = container_remap.clone();
+        let scope = self
+            .begin_apply_diff_scope()
+            .expect("undo has a fresh transaction and owns its writer gate");
+        let result = self._apply_diff(diff, container_remap, skip_unreachable);
+        if result.is_ok() {
+            self.end_apply_diff_scope(scope);
+        } else {
+            self.rollback_apply_diff_scope(scope);
+            *container_remap = remap_before;
+        }
+        result
+    }
+
+    /// Marks where the batch starts in the transaction it will run in.
+    ///
+    /// Returns `None`, and the batch runs without a rollback, when there is no transaction
+    /// to run it in (the batch then fails before it applies anything) or another thread's
+    /// batch runs in it.
+    fn begin_apply_diff_scope(&self) -> Option<u64> {
+        static NEXT_SCOPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let mut guard = self.txn.lock();
+        if guard.is_none() && !cfg!(target_arch = "wasm32") && self.can_edit() {
+            // Like the handlers' `with_txn`, which the batch's first op would call
+            drop(guard);
+            self.start_auto_commit();
+            guard = self.txn.lock();
+        }
+        let txn = guard.as_mut()?;
+        if txn.has_rollback_scope() {
+            return None;
+        }
+        let id = NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        txn.begin_rollback_scope(id);
+        self.state.lock().begin_local_rollback(id);
+        Some(id)
+    }
+
+    fn end_apply_diff_scope(&self, scope: u64) {
+        let mut guard = self.txn.lock();
+        if let Some(txn) = guard.as_mut() {
+            txn.end_rollback_scope(scope);
+        }
+        self.state.lock().end_local_rollback(scope);
+    }
+
+    /// Undo the ops of a failed batch, keeping the ops the transaction held before it.
+    /// Emits nothing.
+    ///
+    /// The transaction's ops are inserted into the op log as a change, under an import
+    /// rollback scope, so that the diff calculator can compute the checkout from the batch's
+    /// last op back to the version before the batch; then the scope is rolled back and the
+    /// ops before the batch are put back into the DAG's version as pending local ops.
+    fn rollback_apply_diff_scope(&self, scope: u64) {
+        let mut guard = self.txn.lock();
+        let txn = guard
+            .as_mut()
+            .filter(|txn| txn.rollback_scope_is_intact(scope))
+            .expect("undo owns the transaction writer gate until rollback finishes");
+
+        let batch = txn.roll_back_scope(scope);
+        let mut oplog = self.oplog.lock();
+        let mut state = self.state.lock();
+        if batch.batch_start < batch.batch_end {
+            let peer = batch.peer;
+            let txn_ops_before = (batch.batch_start - batch.txn_start_counter) as usize;
+            let before_batch = if txn_ops_before == 0 {
+                batch.deps.clone()
+            } else {
+                Frontiers::from_id(ID::new(peer, batch.batch_start - 1))
+            };
+            #[cfg(debug_assertions)]
+            {
+                // Only the txn's ops changed the DAG's version since it began: anything else
+                // (an import, a checkout) commits the txn first.
+                let mut expected = batch.dag_frontiers_at_start.clone();
+                expected.update_frontiers_on_new_change(
+                    ID::new(peer, batch.batch_end - 1),
+                    &batch.deps,
+                );
+                assert_eq!(&expected, oplog.dag.frontiers());
+                assert_eq!(oplog.dag.vv().get(&peer), Some(&batch.batch_end));
+            }
+            oplog.dag.discard_pending_txn(
+                batch.dag_frontiers_at_start,
+                peer,
+                batch.txn_start_counter,
+            );
+            oplog.begin_import_rollback();
+            oplog.insert_new_change(
+                Change {
+                    id: ID::new(peer, batch.txn_start_counter),
+                    lamport: batch.txn_start_lamport,
+                    deps: batch.deps.clone(),
+                    timestamp: batch.timestamp,
+                    commit_msg: None,
+                    ops: batch.ops,
+                },
+                false,
+            );
+
+            let batch_last = state.frontiers.clone();
+            debug_assert_eq!(
+                batch_last,
+                Frontiers::from_id(ID::new(peer, batch.batch_end - 1))
+            );
+            let from = oplog
+                .dag
+                .frontiers_to_vv(&batch_last)
+                .expect("the batch's ops are in the DAG");
+            let to = oplog
+                .dag
+                .frontiers_to_vv(&before_batch)
+                .expect("the version before the batch is in the DAG");
+            let (diff, diff_mode) = DiffCalculator::new(false).calc_diff_internal(
+                &oplog,
+                &from,
+                &batch_last,
+                &to,
+                &before_batch,
+                None,
+            );
+            // `DocState::apply_diff` refuses to run inside a transaction, and records nothing
+            // without its event recorder.
+            state.abort_txn();
+            let recorder = state.take_event_recorder();
+            state
+                .apply_diff(
+                    InternalDocDiff {
+                        origin: Default::default(),
+                        by: EventTriggerKind::Checkout,
+                        diff: Cow::Owned(diff),
+                        new_version: Cow::Owned(before_batch),
+                    },
+                    diff_mode,
+                )
+                .expect("undoing the ops of a failed apply_diff from the state");
+            state.restore_event_recorder(recorder);
+            state.resume_txn();
+            oplog.rollback_import_keeping_arena(&state);
+            if txn_ops_before > 0 {
+                oplog.dag.update_version_on_new_local_op(
+                    &batch.deps,
+                    ID::new(peer, batch.txn_start_counter),
+                    batch.txn_start_lamport,
+                    txn_ops_before,
+                );
+                oplog.refresh_visible_op_count();
+            }
+        }
+        state.finish_local_rollback(scope, batch.peer, batch.batch_start);
+    }
+
     /// Apply a diff to the current state.
     ///
     /// This method will not recreate containers with the same [ContainerID]s.
@@ -1395,7 +1568,27 @@ impl LoroDoc {
                     containers: Box::new(vec![id]),
                 });
             };
-            if let Err(e) = h.apply_diff(diff, container_remap) {
+            let result = h.apply_diff(diff, container_remap);
+            // Fault injection after real operations, including for a single
+            // text container, exercises rollback rather than pre-validation.
+            #[cfg(test)]
+            let result = result.and_then(|()| {
+                AFTER_APPLY_DIFF_HANDLER.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                if FAIL_APPLY_DIFF_AFTER_HANDLER.with(|flag| flag.replace(false)) {
+                    Err(LoroError::OutOfBound {
+                        pos: usize::MAX,
+                        len: 0,
+                        info: "injected apply failure".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(e) = result {
                 ans = Err(e);
             }
         }

@@ -7,6 +7,9 @@ over graceful degradation.
 
 ## Internal Map
 
+- Undo transaction rollback and writer gate:
+  [../../context/undo-atomicity.md](../../context/undo-atomicity.md).
+
 - `src/loro.rs`: document-level orchestration for commit, import/export,
   checkout, barriers, state/oplog coordination, and event emission.
 - `src/encoding.rs`: public/internal `ExportMode`, binary header parsing,

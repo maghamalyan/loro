@@ -381,6 +381,19 @@ impl OpLog {
         self.refresh_visible_op_count();
     }
 
+    // Local rollback must retain container registrations used by state.
+    pub(crate) fn rollback_import_keeping_arena(&mut self, _state: &crate::state::DocState) {
+        let Some(rollback) = self.import_rollback.take() else {
+            return;
+        };
+
+        self.change_store.rollback_import(rollback.change_store);
+        self.dag.rollback_import();
+        rollback.pending.rollback(&mut self.pending_changes);
+        self.history_cache.lock().free_all();
+        self.refresh_visible_op_count();
+    }
+
     pub(crate) fn reset_to_empty_for_failed_snapshot_import(
         &mut self,
         arena_checkpoint: SharedArenaRollback,

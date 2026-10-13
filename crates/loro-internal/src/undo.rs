@@ -361,6 +361,13 @@ impl Stack {
         self.push_with_merge(span, meta, false, None)
     }
 
+    fn restore_popped(&mut self, item: StackItem, remote_diff: &Arc<Mutex<DiffBatch>>) {
+        let last = self.stack.back_mut().unwrap();
+        debug_assert!(Arc::ptr_eq(&last.1, remote_diff));
+        last.0.push_back(item);
+        self.size += 1;
+    }
+
     pub fn push_with_merge(
         &mut self,
         span: CounterSpan,
@@ -821,6 +828,7 @@ impl UndoManager {
             return Ok(false);
         }
         let doc = &self.doc.clone();
+        let _exclusive = doc.txn.lock_exclusive();
         // When in the undo/redo loop, the new undo/redo stack item should restore the selection
         // to the state it was in before the item that was popped two steps ago from the stack.
         //
@@ -910,7 +918,8 @@ impl UndoManager {
                 ) {
                     Ok(c) => c,
                     Err(e) => {
-                        get_stack(&mut self.inner.lock().borrow_mut()).push(span.span, span.meta);
+                        get_stack(&mut self.inner.lock().borrow_mut())
+                            .restore_popped(span, &remote_diff);
                         return Err(e);
                     }
                 };
