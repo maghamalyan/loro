@@ -581,3 +581,36 @@ fn criss_cross_sync_never_rebuilds_the_list_tracker() {
         "concurrent list imports must not rebuild the tracker"
     );
 }
+
+#[test]
+fn retained_full_text_tracker_extends_after_local_and_concurrent_edits() {
+    use crate::diff_calc::FULL_TRACKER_REBUILD_COUNT;
+    let (a, b) = criss_cross(12);
+    let mut rebuilds = 0;
+    for round in 0..40 {
+        let before = a.state_frontiers();
+        let original = a.get_deep_value();
+        a.get_text("t").insert_unicode(round, "😀local").unwrap();
+        a.commit_then_renew();
+        b.get_text("t").insert_unicode(0, "remote").unwrap();
+        b.commit_then_renew();
+        exchange(&a, &b);
+        let latest = a.state_frontiers();
+        let expected = a.get_deep_value();
+        let oracle = LoroDoc::new_auto_commit();
+        oracle
+            .import(&a.export(ExportMode::all_updates()).unwrap())
+            .unwrap();
+        assert_eq!(expected, oracle.get_deep_value());
+        oracle.checkout(&before).unwrap();
+        assert_eq!(original, oracle.get_deep_value());
+        let before_rebuilds = FULL_TRACKER_REBUILD_COUNT.with(|c| c.get());
+        a.checkout(&before).unwrap();
+        assert_eq!(a.get_deep_value(), original);
+        a.checkout(&latest).unwrap();
+        assert_eq!(a.get_deep_value(), expected);
+        a.attach();
+        rebuilds += FULL_TRACKER_REBUILD_COUNT.with(|c| c.get()) - before_rebuilds;
+    }
+    assert_eq!(rebuilds, 1);
+}

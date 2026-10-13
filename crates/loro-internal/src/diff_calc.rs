@@ -555,11 +555,20 @@ fn replay_container_ops_from_empty(
     vv: &VersionVector,
     visitor: &mut dyn RebuildOpVisitor,
 ) {
-    let empty_vv = VersionVector::default();
-    let empty_frontiers = Frontiers::default();
-    let target_frontiers = oplog.dag.vv_to_frontiers(vv);
+    replay_container_ops_since(idx, oplog, &VersionVector::default(), vv, visitor);
+}
+
+fn replay_container_ops_since(
+    idx: ContainerIdx,
+    oplog: &OpLog,
+    since: &VersionVector,
+    target: &VersionVector,
+    visitor: &mut dyn RebuildOpVisitor,
+) {
+    let from_frontiers = oplog.dag.vv_to_frontiers(since);
+    let target_frontiers = oplog.dag.vv_to_frontiers(target);
     let (_, iter) =
-        oplog.iter_from_replay_base_causally(&empty_vv, &empty_frontiers, vv, &target_frontiers);
+        oplog.iter_from_replay_base_causally(since, &from_frontiers, target, &target_frontiers);
 
     for (change, (start_counter, end_counter), vv) in iter {
         let iter_start = change
@@ -571,10 +580,17 @@ fn replay_container_ops_from_empty(
                 break;
             }
 
-            if op.container != idx || op.ctr_last() < start_counter {
+            if op.container != idx
+                || op.ctr_last() < start_counter
+                || since.includes_id(ID::new(change.peer(), op.ctr_last()))
+            {
                 continue;
             }
 
+            let start_counter = start_counter.max(since.get(&change.peer()).copied().unwrap_or(0));
+            if start_counter >= end_counter {
+                continue;
+            }
             let stack_sliced_op;
             if op.counter < start_counter || op.ctr_end() > end_counter {
                 stack_sliced_op = Some(op.slice(
@@ -1004,6 +1020,15 @@ impl DiffCalculatorTrait for ListDiffCalculator {
 #[derive(Debug)]
 pub(crate) struct RichtextDiffCalculator {
     mode: Box<RichtextCalcMode>,
+    full: Option<Box<FullRichtextTracker>>,
+    used_full: bool,
+}
+
+#[derive(Debug)]
+struct FullRichtextTracker {
+    tracker: RichtextTracker,
+    styles: Vec<(StyleOp, usize)>,
+    covered: VersionVector,
 }
 
 #[derive(Debug)]
@@ -1032,6 +1057,73 @@ impl RichtextDiffCalculator {
                 source_not_in_op_context: false,
                 shallow_root_seeded: false,
             }),
+            full: None,
+            used_full: false,
+        }
+    }
+
+    pub(crate) fn prepare_full_tracker(
+        &mut self,
+        idx: ContainerIdx,
+        oplog: &OpLog,
+        merged: &VersionVector,
+    ) {
+        Self::extend_full_tracker(&mut self.full, idx, oplog, merged);
+    }
+
+    fn extend_full_tracker(
+        cache: &mut Option<Box<FullRichtextTracker>>,
+        idx: ContainerIdx,
+        oplog: &OpLog,
+        merged: &VersionVector,
+    ) {
+        // A complete tracker keeps real ids below every replay base.
+        // Extend it with unseen operations before any backward diff.
+        // Shallow roots can change, so retain the existing rebuild there.
+        if !oplog.shallow_since_vv().is_empty() {
+            *cache = None;
+        }
+        let full = cache.get_or_insert_with(|| {
+            #[cfg(test)]
+            FULL_TRACKER_REBUILD_COUNT.with(|c| c.set(c.get() + 1));
+            let (tracker, styles) = Self::build_full_crdt_tracker(idx, oplog, merged);
+            Box::new(FullRichtextTracker {
+                tracker,
+                styles,
+                covered: merged.clone(),
+            })
+        });
+        if !full.covered.includes_vv(merged) {
+            let mut target = full.covered.clone();
+            target.merge(merged);
+            struct Extend<'a> {
+                oplog: &'a OpLog,
+                tracker: &'a mut RichtextTracker,
+                styles: &'a mut Vec<(StyleOp, usize)>,
+            }
+            impl RebuildOpVisitor for Extend<'_> {
+                fn visit(&mut self, vv: &VersionVector, op: RichOp<'_>) {
+                    self.tracker.checkout(vv);
+                    RichtextDiffCalculator::apply_crdt_op_to_tracker(
+                        self.oplog,
+                        self.tracker,
+                        self.styles,
+                        op,
+                    );
+                }
+            }
+            replay_container_ops_since(
+                idx,
+                oplog,
+                &full.covered,
+                &target,
+                &mut Extend {
+                    oplog,
+                    tracker: &mut full.tracker,
+                    styles: &mut full.styles,
+                },
+            );
+            full.covered = target;
         }
     }
 
@@ -1129,6 +1221,14 @@ impl RichtextDiffCalculator {
     ///
     /// TODO: Refactor, this can be simplified
     pub fn get_id_latest_pos(&self, id: ID) -> Option<AbsolutePosition> {
+        if self.used_full {
+            return self
+                .full
+                .as_ref()
+                .unwrap()
+                .tracker
+                .get_target_id_latest_index_at_new_version(id);
+        }
         match &*self.mode {
             RichtextCalcMode::Crdt { tracker, .. } => {
                 tracker.get_target_id_latest_index_at_new_version(id)
@@ -1775,6 +1875,7 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
             }
         }
 
+        self.used_full = false;
         match &mut *self.mode {
             RichtextCalcMode::Linear { diff, .. } => (
                 InternalDiff::RichtextRaw(std::mem::take(diff)),
@@ -1820,23 +1921,15 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                     // Preserve correctness by replacing the visible source state with the target
                     // state reconstructed from CRDT ids. Shallow docs seed this tracker from the
                     // shallow-root state and replay only the retained suffix of history.
-                    #[cfg(test)]
-                    FULL_TRACKER_REBUILD_COUNT.with(|c| c.set(c.get() + 1));
                     let mut merged = info.from_vv.clone();
                     merged.merge(info.to_vv);
-                    let (mut full_tracker, full_styles) =
-                        Self::build_full_crdt_tracker(idx, oplog, &merged);
-
+                    self.used_full = true;
+                    Self::extend_full_tracker(&mut self.full, idx, oplog, &merged);
+                    let full = self.full.as_mut().unwrap();
                     let mut delta = DeltaRope::new();
-                    for item in full_tracker.diff(info.from_vv, info.to_vv) {
-                        push_tracker_delta_item(&mut delta, idx, oplog, &full_styles, item);
+                    for item in full.tracker.diff(info.from_vv, info.to_vv) {
+                        push_tracker_delta_item(&mut delta, idx, oplog, &full.styles, item);
                     }
-                    **tracker = full_tracker;
-                    *styles = full_styles;
-                    // `start_vv` is deliberately left as-is: the rebuild's
-                    // real seed is even lower (the empty version, or the
-                    // shallow root), so the reseed test in `start_tracking`
-                    // only becomes more conservative.
 
                     return (InternalDiff::RichtextRaw(delta), DiffMode::Checkout);
                 }

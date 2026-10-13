@@ -2313,6 +2313,23 @@ impl LoroDoc {
         *self.diff_calculator.lock() = DiffCalculator::new(true);
     }
 
+    /// Advances the retained text undo tracker without changing document state
+    /// or emitting events. Editors can call this after each commit to spread
+    /// the preparation cost over edits instead of paying it on the first undo.
+    pub fn prepare_text_undo(&self, container: &ContainerID) {
+        self.with_barrier(|| {
+            let oplog = self.oplog.lock();
+            let Some(idx) = self.arena.id_to_idx(container) else {
+                return;
+            };
+            let mut calculator = self.diff_calculator.lock();
+            let (_, calc) = calculator.get_or_create_calc(idx, self.arena.get_depth(idx));
+            if let crate::diff_calc::ContainerDiffCalculator::Richtext(text) = calc {
+                text.prepare_full_tracker(idx, &oplog, oplog.vv());
+            }
+        });
+    }
+
     /// If you use checkout that switching to an old/concurrent version, the history cache will be built.
     /// You can free it by calling `free_history_cache`.
     pub fn has_history_cache(&self) -> bool {
