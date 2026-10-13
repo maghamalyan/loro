@@ -9,6 +9,9 @@ pub trait DeltaValue:
 
 pub trait DeltaAttr: Clone + PartialEq + Debug + Default {
     fn compose(&mut self, other: &Self);
+    /// Transform attribute writes through another delta. With right priority,
+    /// keys written by the other side must not be overwritten by this delta.
+    fn transform(&mut self, _other: &Self, _left_prior: bool) {}
     fn attr_is_empty(&self) -> bool;
 }
 
@@ -31,6 +34,12 @@ mod implementations {
         fn compose(&mut self, other: &Self) {
             for (key, value) in other {
                 self.insert(key.clone(), value.clone());
+            }
+        }
+
+        fn transform(&mut self, other: &Self, left_prior: bool) {
+            if !left_prior {
+                self.retain(|key, _| !other.contains_key(key));
             }
         }
 

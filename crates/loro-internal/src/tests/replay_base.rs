@@ -626,7 +626,7 @@ fn retained_text_tracker_handles_grouped_deletes_marks_and_cache_release() {
             a.free_diff_calculator();
         }
         let before = a.state_frontiers();
-        let original = a.get_deep_value();
+        let original = a.get_text("t").get_richtext_value();
         undo.group_start().unwrap();
         let text = a.get_text("t");
         text.insert_unicode(0, "😀local").unwrap();
@@ -639,18 +639,18 @@ fn retained_text_tracker_handles_grouped_deletes_marks_and_cache_release() {
         b.get_text("t").insert_unicode(0, "remote").unwrap();
         b.commit_then_renew();
         exchange(&a, &b);
-        let expected = a.get_deep_value();
+        let expected = a.get_text("t").get_richtext_value();
         let count = FULL_TRACKER_REBUILD_COUNT.with(|c| c.get());
         assert!(undo.undo().unwrap());
-        let reverted = a.get_deep_value();
+        let reverted = a.get_text("t").get_richtext_value();
         assert!(undo.redo().unwrap());
-        assert_eq!(a.get_deep_value(), expected);
+        assert_eq!(a.get_text("t").get_richtext_value(), expected);
         let latest = a.state_frontiers();
         undo.pause();
         a.checkout(&before).unwrap();
-        assert_eq!(a.get_deep_value(), original);
+        assert_eq!(a.get_text("t").get_richtext_value(), original);
         a.checkout(&latest).unwrap();
-        assert_eq!(a.get_deep_value(), expected);
+        assert_eq!(a.get_text("t").get_richtext_value(), expected);
         a.attach();
         undo.resume();
         rebuilds += FULL_TRACKER_REBUILD_COUNT.with(|c| c.get()) - count;
@@ -658,8 +658,37 @@ fn retained_text_tracker_handles_grouped_deletes_marks_and_cache_release() {
         oracle
             .import(&a.export(ExportMode::Snapshot).unwrap())
             .unwrap();
-        assert_eq!(oracle.get_deep_value(), expected);
+        assert_eq!(oracle.get_text("t").get_richtext_value(), expected);
         assert_ne!(reverted, expected);
     }
     assert!(rebuilds <= 2, "one build per cache lifetime: {rebuilds}");
+}
+
+#[test]
+fn selective_undo_preserves_later_overlapping_marks() {
+    use crate::{cursor::PosType, undo::UndoManager};
+    let doc = LoroDoc::new_auto_commit();
+    let text = doc.get_text("t");
+    text.insert_unicode(0, "abcdefghij").unwrap();
+    doc.commit_then_renew();
+    let a = UndoManager::new(&doc);
+    let b = UndoManager::new(&doc);
+    b.pause();
+    text.mark(1, 9, "bold", "A".into(), PosType::Unicode)
+        .unwrap();
+    doc.commit_then_renew();
+    a.pause();
+    b.resume();
+    text.mark(4, 7, "bold", "B".into(), PosType::Unicode)
+        .unwrap();
+    doc.commit_then_renew();
+    b.pause();
+    a.resume();
+    assert!(a.undo().unwrap());
+    assert_eq!(
+        serde_json::to_value(text.get_richtext_value()).unwrap(),
+        serde_json::json!([
+            {"insert": "abcd"}, {"insert": "efg", "attributes": {"bold": "B"}}, {"insert": "hij"}
+        ])
+    );
 }

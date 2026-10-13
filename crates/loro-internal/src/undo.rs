@@ -72,6 +72,20 @@ impl DiffBatch {
         }
     }
 
+    fn transform_inverse(&mut self, other: &Self) {
+        for (id, diff) in &mut self.cid_to_events {
+            if let Some(base) = other.cid_to_events.get(id) {
+                if let (Diff::Text(text), Diff::Text(remote)) = (&mut *diff, base) {
+                    // Undo retains its insertion-side ordering, but must not
+                    // overwrite attributes authored by a later editor.
+                    *text = text.transform_with_attribute_priority(remote, true, false);
+                } else {
+                    diff.transform(base, true);
+                }
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.cid_to_events.clear();
         self.order.clear();
@@ -1173,7 +1187,7 @@ pub(crate) fn undo(
             // --------------------------------------------------
             // 3. Transform event A'_i based on B_i, call it C_i
             // --------------------------------------------------
-            event_a_prime.transform(event_b_i, true);
+            event_a_prime.transform_inverse(event_b_i);
 
             // println!("event_a_prime: {:?}", event_a_prime);
 

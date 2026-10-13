@@ -315,6 +315,10 @@ impl DeltaAttr for TextMeta {
         }
     }
 
+    fn transform(&mut self, other: &Self, left_prior: bool) {
+        self.0.transform(&other.0, left_prior);
+    }
+
     fn attr_is_empty(&self) -> bool {
         self.0.is_empty()
     }
