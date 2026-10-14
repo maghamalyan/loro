@@ -213,6 +213,52 @@ impl RichtextState {
         None
     }
 
+    /// Resolve batches of live scalar identities with one traversal, skipping
+    /// deleted identities without consulting the operation history.
+    pub fn live_unicode_ranges(&mut self, spans: &[(u64, i32, i32)]) -> Vec<Range<usize>> {
+        let mut by_peer = std::collections::BTreeMap::<u64, Vec<Range<i32>>>::new();
+        for &(peer, start, end) in spans {
+            if start < end {
+                by_peer.entry(peer).or_default().push(start..end);
+            }
+        }
+        for ranges in by_peer.values_mut() {
+            ranges.sort_unstable_by_key(|r| r.start);
+            let mut merged: Vec<Range<i32>> = Vec::new();
+            for range in ranges.drain(..) {
+                if let Some(last) = merged.last_mut() {
+                    if range.start <= last.end {
+                        last.end = last.end.max(range.end);
+                        continue;
+                    }
+                }
+                merged.push(range);
+            }
+            *ranges = merged;
+        }
+        let mut result = Vec::new();
+        let mut pos = 0;
+        for elem in self.state.get_mut().iter_chunk() {
+            let RichtextStateChunk::Text(text) = elem else {
+                continue;
+            };
+            let span = elem.get_id_span();
+            if let Some(ranges) = by_peer.get(&span.peer) {
+                let first = ranges.partition_point(|range| range.end <= span.counter.start);
+                for range in &ranges[first..] {
+                    if range.start >= span.counter.end {
+                        break;
+                    }
+                    let start = range.start.max(span.counter.start) - span.counter.start;
+                    let end = range.end.min(span.counter.end) - span.counter.start;
+                    result.push(pos + start as usize..pos + end as usize);
+                }
+            }
+            pos += text.unicode_len() as usize;
+        }
+        result
+    }
+
     pub fn get_text_index_of_id(&self, id: ID, use_event_index: bool) -> Option<usize> {
         let iter: &mut dyn Iterator<Item = &RichtextStateChunk>;
         let mut a;

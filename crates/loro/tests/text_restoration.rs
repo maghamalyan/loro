@@ -94,3 +94,25 @@ fn live_identity_lookup_does_not_recover_deleted_characters() {
     assert_eq!(doc.inner().query_live_pos(&cursor), None);
     assert!(doc.get_cursor_pos(&cursor).is_ok());
 }
+
+#[test]
+fn live_identity_batches_skip_deleted_endpoints_and_merge_overlaps() {
+    use loro::ContainerTrait;
+    let doc = LoroDoc::new();
+    let text = doc.get_text("text");
+    text.insert(0, "a😀bcdef").unwrap();
+    doc.commit();
+    let first = text
+        .get_cursor(0, loro::cursor::Side::Middle)
+        .unwrap()
+        .id
+        .unwrap();
+    text.delete(6, 1).unwrap();
+    text.delete(0, 1).unwrap();
+    doc.commit();
+    let spans = [
+        (first.peer, first.counter, first.counter + 7),
+        (first.peer, first.counter + 2, first.counter + 4),
+    ];
+    assert_eq!(text.to_handler().live_unicode_ranges(&spans), vec![0..5]);
+}

@@ -2698,6 +2698,19 @@ impl TextHandler {
         }))
     }
 
+    /// Current Unicode ranges covered by identity spans (peer, start, end).
+    /// Absent/deleted identities contribute no range; detached text is empty.
+    pub fn live_unicode_ranges(&self, spans: &[(u64, i32, i32)]) -> Vec<std::ops::Range<usize>> {
+        match &self.inner {
+            MaybeDetached::Detached(_) => Vec::new(),
+            MaybeDetached::Attached(a) => a.with_state(|s| {
+                s.as_richtext_state_mut()
+                    .unwrap()
+                    .live_unicode_ranges(spans)
+            }),
+        }
+    }
+
     pub fn get_cursor(&self, event_index: usize, side: Side) -> Option<Cursor> {
         self.get_cursor_internal(event_index, side, true)
     }
