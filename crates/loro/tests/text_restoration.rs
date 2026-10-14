@@ -116,3 +116,46 @@ fn live_identity_batches_skip_deleted_endpoints_and_merge_overlaps() {
     ];
     assert_eq!(text.to_handler().live_unicode_ranges(&spans), vec![0..5]);
 }
+
+#[test]
+fn unicode_identity_ranges_match_scalar_cursors_across_styles_and_deletions() {
+    use loro::{ContainerTrait, ExpandType, StyleConfig, StyleConfigMap};
+    let doc = LoroDoc::new();
+    let mut styles = StyleConfigMap::new();
+    styles.insert(
+        "bold".into(),
+        StyleConfig {
+            expand: ExpandType::After,
+        },
+    );
+    doc.config_text_style(styles);
+    let text = doc.get_text("text");
+    text.insert(0, "a😀bcdef").unwrap();
+    text.mark(1..5, "bold", true).unwrap();
+    doc.commit();
+    text.delete(3, 1).unwrap();
+    text.insert(2, "é").unwrap();
+    doc.commit();
+    for start in 0..text.len_unicode() {
+        for end in start..=text.len_unicode() {
+            let ids: Vec<_> = text
+                .to_handler()
+                .unicode_identity_spans(start..end)
+                .unwrap()
+                .into_iter()
+                .flat_map(|(peer, start, len)| (0..len).map(move |i| (peer, start + i as i32)))
+                .collect();
+            let cursors: Vec<_> = (start..end)
+                .map(|i| {
+                    let id = text
+                        .get_cursor(i, loro::cursor::Side::Middle)
+                        .unwrap()
+                        .id
+                        .unwrap();
+                    (id.peer, id.counter)
+                })
+                .collect();
+            assert_eq!(ids, cursors);
+        }
+    }
+}

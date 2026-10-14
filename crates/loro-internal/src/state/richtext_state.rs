@@ -1070,6 +1070,16 @@ impl RichtextState {
             .get_styles_at_entity_index_for_insert(entity_index)
     }
 
+    pub(crate) fn get_text_entity_ranges_in_unicode_range(
+        &mut self,
+        pos: usize,
+        len: usize,
+    ) -> LoroResult<EntityRanges> {
+        self.state
+            .get_mut()
+            .get_text_entity_ranges(pos, len, PosType::Unicode)
+    }
+
     #[inline]
     pub(crate) fn get_text_entity_ranges_in_event_index_range(
         &mut self,

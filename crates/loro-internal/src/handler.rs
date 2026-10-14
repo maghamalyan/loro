@@ -2711,6 +2711,36 @@ impl TextHandler {
         }
     }
 
+    /// Physical operation identities of the live Unicode scalars in a range.
+    /// Style anchors are skipped. Detached text has no operation identities.
+    pub fn unicode_identity_spans(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> LoroResult<Vec<(u64, i32, usize)>> {
+        match &self.inner {
+            MaybeDetached::Detached(_) => Ok(Vec::new()),
+            MaybeDetached::Attached(a) => a.with_state(|s| {
+                let ranges = s
+                    .as_richtext_state_mut()
+                    .unwrap()
+                    .get_text_entity_ranges_in_unicode_range(
+                        range.start,
+                        range.end.saturating_sub(range.start),
+                    )?;
+                Ok(ranges
+                    .into_iter()
+                    .map(|r| {
+                        (
+                            r.id_start.peer,
+                            r.id_start.counter,
+                            r.entity_end - r.entity_start,
+                        )
+                    })
+                    .collect())
+            }),
+        }
+    }
+
     pub fn get_cursor(&self, event_index: usize, side: Side) -> Option<Cursor> {
         self.get_cursor_internal(event_index, side, true)
     }
