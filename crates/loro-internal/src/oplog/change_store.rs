@@ -26,6 +26,10 @@ use rle::{HasLength, Mergable, RlePush, RleVec, Sliceable};
 use rustc_hash::FxHashSet;
 use std::sync::atomic::AtomicI64;
 #[cfg(test)]
+thread_local! {
+    static BLOCK_LOAD_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
     cmp::Ordering,
@@ -1405,6 +1409,36 @@ mod mut_inner_kv {
         /// This is fast because we don't actually parse the content.
         // TODO: PERF: This method feels slow.
         pub(super) fn ensure_block_loaded_in_range(&self, start: Bound<ID>, end: Bound<ID>) {
+            // Most live edits ask for an operation in a block already in
+            // memory. Avoid probing the snapshot SSTables in that case: a
+            // bounded scan may decompress both endpoint blocks even when it
+            // ultimately finds no persisted operations for this new peer.
+            if let (Bound::Included(first), Bound::Included(last) | Bound::Excluded(last)) =
+                (start, end)
+            {
+                let last = if matches!(end, Bound::Excluded(_)) {
+                    last.inc(-1)
+                } else {
+                    last
+                };
+                if first.peer == last.peer && first.counter <= last.counter {
+                    let inner = self.inner.lock();
+                    if inner
+                        .mem_parsed_kv
+                        .range(..=first)
+                        .next_back()
+                        .is_some_and(|(_, block)| {
+                            block.peer == first.peer
+                                && block.counter_range.0 <= first.counter
+                                && last.counter < block.counter_range.1
+                        })
+                    {
+                        return;
+                    }
+                }
+            }
+            #[cfg(test)]
+            BLOCK_LOAD_SCAN_COUNT.with(|count| count.set(count.get() + 1));
             let mut whether_need_scan_backward = match start {
                 Bound::Included(id) => Some(id),
                 Bound::Excluded(id) => Some(id.inc(1)),
@@ -1952,6 +1986,38 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn loaded_operation_ranges_do_not_probe_snapshot_blocks() {
+        for peer in [1, u64::MAX - 1] {
+            let doc = LoroDoc::new_auto_commit();
+            doc.set_peer_id(peer).unwrap();
+            doc.get_text("text")
+                .insert(0, "abcdef", PosType::Unicode)
+                .unwrap();
+            doc.commit_then_renew();
+            let bytes = {
+                let oplog = doc.oplog().lock();
+                oplog
+                    .change_store
+                    .encode_all(oplog.vv(), oplog.dag.frontiers())
+            };
+            let store = ChangeStore::new_for_test();
+            let _ = store.import_all(bytes).unwrap();
+            assert_eq!(store.get_change(ID::new(peer, 2)).unwrap().atom_len(), 6);
+            let before = BLOCK_LOAD_SCAN_COUNT.with(|count| count.get());
+            for _ in 0..20 {
+                assert_eq!(store.get_change(ID::new(peer, 5)).unwrap().atom_len(), 6);
+                assert_eq!(store.iter_changes(IdSpan::new(peer, 1, 6)).count(), 1);
+            }
+            assert_eq!(BLOCK_LOAD_SCAN_COUNT.with(|count| count.get()), before);
+            // A different peer must still take the loading path.
+            let absent = ID::new(peer ^ 1, 0);
+            store.ensure_block_loaded_in_range(Bound::Included(absent), Bound::Included(absent));
+            assert!(store.get_change(absent).is_none());
+            assert!(BLOCK_LOAD_SCAN_COUNT.with(|count| count.get()) > before);
+        }
+    }
 
     fn test_encode_decode(doc: LoroDoc) {
         doc.commit_then_renew();
