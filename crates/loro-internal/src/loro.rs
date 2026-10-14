@@ -1359,9 +1359,9 @@ impl LoroDoc {
                 None => Either::Left(&latest_frontiers),
             },
             |from, to| {
-                self._checkout_without_emitting(from, false, false).unwrap();
+                self.checkout_undo_containers(from, containers).unwrap();
                 self.state.lock().start_recording();
-                self._checkout_without_emitting(to, false, false).unwrap();
+                self.checkout_undo_containers(to, containers).unwrap();
                 let mut state = self.state.lock();
                 let e = state.take_events();
                 state.stop_and_clear_recording();
@@ -1381,7 +1381,7 @@ impl LoroDoc {
         // println!("\nundo_internal: diff: {:?}", diff);
         // println!("container remap: {:?}", container_remap);
 
-        self._checkout_without_emitting(&latest_frontiers, false, false)?;
+        self.checkout_undo_containers(&latest_frontiers, containers)?;
         self.set_detached(false);
         if was_recording {
             self.state.lock().start_recording();
@@ -2084,6 +2084,23 @@ impl LoroDoc {
         )
     }
 
+    // Used only under the exclusive undo transaction. Excluded containers
+    // remain at the latest state throughout these temporary checkouts; the
+    // selected containers return to latest before applying the inverse.
+    fn checkout_undo_containers(
+        &self,
+        frontiers: &Frontiers,
+        containers: Option<&rustc_hash::FxHashSet<ContainerID>>,
+    ) -> LoroResult<()> {
+        self.checkout_filtered(
+            frontiers,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+            containers,
+        )
+    }
+
     fn _checkout_without_emitting_with_event(
         &self,
         frontiers: &Frontiers,
@@ -2092,6 +2109,17 @@ impl LoroDoc {
         origin: InternalString,
         triggered_by: EventTriggerKind,
     ) -> Result<(), LoroError> {
+        self.checkout_filtered(frontiers, to_shrink_frontiers, origin, triggered_by, None)
+    }
+
+    fn checkout_filtered(
+        &self,
+        frontiers: &Frontiers,
+        to_shrink_frontiers: bool,
+        origin: InternalString,
+        triggered_by: EventTriggerKind,
+        containers: Option<&rustc_hash::FxHashSet<ContainerID>>,
+    ) -> LoroResult<()> {
         if !self.txn.is_locked() {
             return Err(LoroError::TransactionError(
                 "checkout requires the transaction mutex to be held"
@@ -2151,8 +2179,19 @@ impl LoroDoc {
         };
 
         self.set_detached(true);
-        let (diff, diff_mode) =
-            calc.calc_diff_internal(&oplog, &before, &state.frontiers, after, &frontiers, None);
+        let filter = |idx| {
+            containers
+                .unwrap()
+                .contains(&oplog.arena.get_container_id(idx).unwrap())
+        };
+        let (diff, diff_mode) = calc.calc_diff_internal(
+            &oplog,
+            &before,
+            &state.frontiers,
+            after,
+            &frontiers,
+            containers.map(|_| &filter as &dyn Fn(ContainerIdx) -> bool),
+        );
         state.apply_diff(
             InternalDocDiff {
                 origin,
