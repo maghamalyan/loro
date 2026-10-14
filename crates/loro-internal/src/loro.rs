@@ -2278,6 +2278,15 @@ impl LoroDoc {
         }
     }
 
+    /// Locate a currently present identity in Unicode coordinates, without
+    /// recovering deleted cursors through history. Returns None if absent.
+    pub fn query_live_pos(&self, pos: &Cursor) -> Option<usize> {
+        if !self.has_container(&pos.container) {
+            return None;
+        }
+        self.state.lock().get_relative_position(pos, false)
+    }
+
     pub fn query_pos(&self, pos: &Cursor) -> Result<PosQueryResult, CannotFindRelativePosition> {
         self.query_pos_internal(pos, true)
     }

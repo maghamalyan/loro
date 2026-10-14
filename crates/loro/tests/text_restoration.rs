@@ -80,3 +80,17 @@ fn grouped_typing_skips_disjoint_excluded_metadata() {
     assert_eq!(text.to_string(), "x".repeat(20));
     assert_eq!(metadata.len(), 20);
 }
+
+#[test]
+fn live_identity_lookup_does_not_recover_deleted_characters() {
+    let doc = LoroDoc::new();
+    let text = doc.get_text("text");
+    text.insert(0, "a😀b").unwrap();
+    doc.commit();
+    let cursor = text.get_cursor(1, loro::cursor::Side::Middle).unwrap();
+    assert_eq!(doc.inner().query_live_pos(&cursor), Some(1));
+    text.delete(1, 1).unwrap();
+    doc.commit();
+    assert_eq!(doc.inner().query_live_pos(&cursor), None);
+    assert!(doc.get_cursor_pos(&cursor).is_ok());
+}
