@@ -1315,6 +1315,23 @@ impl LoroDoc {
         post_transform_base: Option<&DiffBatch>,
         before_diff: &mut dyn FnMut(&DiffBatch),
     ) -> LoroResult<CommitWhenDrop<'_>> {
+        self.undo_internal_filtered(
+            id_span,
+            container_remap,
+            post_transform_base,
+            None,
+            before_diff,
+        )
+    }
+
+    pub(crate) fn undo_internal_filtered(
+        &self,
+        id_span: IdSpan,
+        container_remap: &mut FxHashMap<ContainerID, ContainerID>,
+        post_transform_base: Option<&DiffBatch>,
+        containers: Option<&rustc_hash::FxHashSet<ContainerID>>,
+        before_diff: &mut dyn FnMut(&DiffBatch),
+    ) -> LoroResult<CommitWhenDrop<'_>> {
         let _exclusive = self.txn.lock_exclusive();
         if !self.can_edit() {
             return Err(LoroError::EditWhenDetached);
@@ -1372,6 +1389,12 @@ impl LoroDoc {
         drop(txn);
         self.start_auto_commit();
         let mut diff = diff;
+        if let Some(containers) = containers {
+            for batch in std::iter::once(&mut diff).chain(inverse_before_transform.iter_mut()) {
+                batch.cid_to_events.retain(|id, _| containers.contains(id));
+                batch.order.retain(|id| containers.contains(id));
+            }
+        }
         let restored = if self
             .capture_text_restoration
             .load(std::sync::atomic::Ordering::Relaxed)

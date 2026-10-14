@@ -279,6 +279,9 @@ struct Stack {
 struct StackItem {
     span: CounterSpan,
     meta: UndoItemMeta,
+    // A group may span excluded writes to disjoint containers. Its inverse
+    // is restricted to the containers actually edited by the group.
+    containers: Option<FxHashSet<ContainerID>>,
 }
 
 /// The metadata of an undo item.
@@ -410,7 +413,11 @@ impl Stack {
             // Create a new entry in the stack
             drop(last_remote_diff);
             let mut v = VecDeque::new();
-            v.push_back(StackItem { span, meta });
+            v.push_back(StackItem {
+                span,
+                meta,
+                containers: None,
+            });
             self.stack
                 .push_back((v, Arc::new(Mutex::new(DiffBatch::default()))));
             self.size += 1;
@@ -420,8 +427,12 @@ impl Stack {
         // Try to merge with the previous entry if allowed
         if can_merge {
             if let Some(last_span) = last.0.back_mut() {
-                if last_span.span.end == span.start {
-                    // Merge spans by extending the end of the last span
+                if (last_span.span.end == span.start || is_disjoint_group)
+                    && (last_span.containers.is_none() || group.is_some())
+                {
+                    if last_span.span.end != span.start || last_span.containers.is_some() {
+                        last_span.containers = group.map(|group| group.affected_cids.clone());
+                    }
                     last_span.span.end = span.end;
                     return;
                 }
@@ -430,7 +441,11 @@ impl Stack {
 
         // Add as a new item to the existing entry
         self.size += 1;
-        last.0.push_back(StackItem { span, meta });
+        last.0.push_back(StackItem {
+            span,
+            meta,
+            containers: None,
+        });
     }
 
     pub fn compose_remote_event(&mut self, diff: &[&ContainerDiff]) {
@@ -915,13 +930,14 @@ impl UndoManager {
                 let inner = self.inner.clone();
                 // We need to clone this because otherwise <transform_delta> will be applied to the same remote diff
                 let remote_change_clone = remote_diff.lock().clone();
-                let commit = match doc.undo_internal(
+                let commit = match doc.undo_internal_filtered(
                     IdSpan {
                         peer: self.peer(),
                         counter: span.span,
                     },
                     &mut self.container_remap.lock(),
                     Some(&remote_change_clone),
+                    span.containers.as_ref(),
                     &mut |diff| {
                         info_span!("transform remote diff").in_scope(|| {
                             let inner = inner.lock();

@@ -54,3 +54,29 @@ fn restoration_capture_is_opt_in() {
     undo.undo_one().unwrap();
     assert!(doc.inner().take_text_restoration().is_empty());
 }
+
+#[test]
+fn grouped_typing_skips_disjoint_excluded_metadata() {
+    use loro::CommitOptions;
+    let doc = LoroDoc::new();
+    let text = doc.get_text("text");
+    let metadata = doc.get_list("metadata");
+    let mut undo = UndoManager::new(&doc);
+    undo.set_merge_interval(0);
+    undo.add_exclude_origin_prefix("metadata");
+    undo.group_start().unwrap();
+    for i in 0..20 {
+        text.insert(i, "x").unwrap();
+        doc.commit();
+        metadata.push(i as i64).unwrap();
+        doc.commit_with(CommitOptions::new().origin("metadata"));
+    }
+    undo.group_end();
+    assert_eq!(undo.undo_count(), 1);
+    undo.undo_one().unwrap();
+    assert_eq!(text.to_string(), "");
+    assert_eq!(metadata.len(), 20);
+    undo.redo_one().unwrap();
+    assert_eq!(text.to_string(), "x".repeat(20));
+    assert_eq!(metadata.len(), 20);
+}
