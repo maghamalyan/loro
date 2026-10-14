@@ -142,6 +142,8 @@ impl std::ops::Deref for LoroDoc {
 }
 
 pub struct LoroDocInner {
+    capture_text_restoration: AtomicBool,
+    text_restoration: parking_lot::Mutex<Vec<(loro_common::ContainerID, ID, ID)>>,
     oplog: Arc<LoroMutex<OpLog>>,
     state: Arc<LoroMutex<DocState>>,
     arena: SharedArena,

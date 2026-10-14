@@ -148,6 +148,8 @@ impl LoroDoc {
         let inner = Arc::new_cyclic(|w| {
             let state = DocState::new_arc(w.clone(), arena.clone(), config.clone(), &lock_group);
             LoroDocInner {
+                capture_text_restoration: AtomicBool::new(false),
+                text_restoration: parking_lot::Mutex::default(),
                 oplog: Arc::new(lock_group.new_lock(oplog, LockKind::OpLog)),
                 state,
                 config,
@@ -1189,6 +1191,109 @@ impl LoroDoc {
         exist
     }
 
+    /// Enable operation-identity reports for text restored by undo/redo.
+    /// Reports are local transport metadata; applications must replicate any
+    /// logical-identity aliases they need. Disabled by default.
+    pub fn capture_text_restoration(&self, enabled: bool) {
+        self.capture_text_restoration
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.text_restoration.lock().clear();
+    }
+
+    /// Drain (container, new physical ID, original physical ID) reports.
+    pub fn take_text_restoration(&self) -> Vec<(ContainerID, ID, ID)> {
+        std::mem::take(&mut *self.text_restoration.lock())
+    }
+
+    fn annotate_restored_characters(&self, batch: &mut DiffBatch) {
+        use crate::handler::TextDelta;
+        for (container, diff) in &mut batch.cid_to_events {
+            let crate::event::Diff::Text(text) = diff else {
+                continue;
+            };
+            let handler = self.get_text(container.clone());
+            let mut pos = 0;
+            let mut result = Vec::new();
+            for item in TextDelta::from_text_diff(text.iter()) {
+                match item {
+                    TextDelta::Insert { insert, attributes } => {
+                        for ch in insert.chars() {
+                            let mut attributes = attributes.clone().unwrap_or_default();
+                            if let Some(id) = handler
+                                .get_cursor(pos, crate::cursor::Side::Middle)
+                                .and_then(|c| c.id)
+                            {
+                                attributes.insert(
+                                    "\0loro.undo.source".into(),
+                                    LoroValue::from(format!("{}:{}", id.peer, id.counter)),
+                                );
+                            }
+                            result.push(TextDelta::Insert {
+                                insert: ch.to_string(),
+                                attributes: Some(attributes),
+                            });
+                            pos += if cfg!(feature = "wasm") {
+                                ch.len_utf16()
+                            } else {
+                                1
+                            };
+                        }
+                    }
+                    TextDelta::Retain { retain, attributes } => {
+                        pos += retain;
+                        result.push(TextDelta::Retain { retain, attributes });
+                    }
+                    item => result.push(item),
+                }
+            }
+            *text = TextDelta::into_text_diff(result.into_iter());
+        }
+    }
+
+    fn extract_restored_characters(batch: &mut DiffBatch) -> Vec<(ContainerID, usize, ID)> {
+        use crate::handler::TextDelta;
+        let mut restored = Vec::new();
+        for (container, diff) in &mut batch.cid_to_events {
+            let crate::event::Diff::Text(text) = diff else {
+                continue;
+            };
+            let mut pos = 0;
+            let mut result = TextDelta::from_text_diff(text.iter());
+            for item in &mut result {
+                match item {
+                    TextDelta::Insert { insert, attributes } => {
+                        if let Some(LoroValue::String(source)) = attributes
+                            .as_mut()
+                            .and_then(|a| a.remove("\0loro.undo.source"))
+                        {
+                            let (peer, counter) =
+                                source.split_once(':').expect("internal source identity");
+                            restored.push((
+                                container.clone(),
+                                pos,
+                                ID::new(peer.parse().unwrap(), counter.parse().unwrap()),
+                            ));
+                        }
+                        pos += if cfg!(feature = "wasm") {
+                            insert.encode_utf16().count()
+                        } else {
+                            insert.chars().count()
+                        };
+                    }
+                    TextDelta::Retain { retain, attributes } => {
+                        if let Some(attributes) = attributes {
+                            attributes.remove("\0loro.undo.source");
+                        }
+                        pos += *retain;
+                    }
+                    TextDelta::Delete { .. } => {}
+                }
+            }
+            *text = TextDelta::into_text_diff(result.into_iter());
+        }
+        restored
+    }
+
     /// Undo the operations between the given id_span. It can be used even in a collaborative environment.
     ///
     /// This is an internal API. You should NOT use it directly.
@@ -1243,7 +1348,15 @@ impl LoroDoc {
                 let mut state = self.state.lock();
                 let e = state.take_events();
                 state.stop_and_clear_recording();
-                DiffBatch::new(e)
+                drop(state);
+                let mut batch = DiffBatch::new(e);
+                if self
+                    .capture_text_restoration
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.annotate_restored_characters(&mut batch);
+                }
+                batch
             },
             &mut |diff| inverse_before_transform = Some(diff.clone()),
         );
@@ -1258,12 +1371,33 @@ impl LoroDoc {
         }
         drop(txn);
         self.start_auto_commit();
+        let mut diff = diff;
+        let restored = if self
+            .capture_text_restoration
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            Self::extract_restored_characters(&mut diff)
+        } else {
+            Vec::new()
+        };
         let result = self.apply_diff_all_or_nothing(diff, container_remap, true);
 
         if let Some(options) = options {
             self.set_next_commit_options(options);
         }
         result?;
+        for (mut container, pos, original) in restored {
+            while let Some(mapped) = container_remap.get(&container) {
+                container = mapped.clone();
+            }
+            if let Some(id) = self
+                .get_text(container.clone())
+                .get_cursor(pos, crate::cursor::Side::Middle)
+                .and_then(|c| c.id)
+            {
+                self.text_restoration.lock().push((container, id, original));
+            }
+        }
         if let Some(diff) = inverse_before_transform {
             before_diff(&diff);
         }
