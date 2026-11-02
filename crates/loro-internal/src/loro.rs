@@ -928,11 +928,19 @@ impl LoroDoc {
     /// only supports backward compatibility but not forward compatibility.
     #[tracing::instrument(skip_all)]
     pub fn import_json_updates<T: TryInto<JsonSchema>>(&self, json: T) -> LoroResult<ImportStatus> {
+        self.import_json_updates_with(json, Default::default())
+    }
+
+    pub fn import_json_updates_with<T: TryInto<JsonSchema>>(
+        &self,
+        json: T,
+        origin: InternalString,
+    ) -> LoroResult<ImportStatus> {
         let json = json.try_into().map_err(|_| LoroError::InvalidJsonSchema)?;
         self.with_barrier(|| {
             let result = self.import_changes_and_apply_delta_to_state_if_needed(
                 |oplog| crate::encoding::json_schema::decode_json_changes(json, &oplog.arena),
-                Default::default(),
+                origin,
             );
             self.emit_events();
             result
