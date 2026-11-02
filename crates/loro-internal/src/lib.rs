@@ -151,6 +151,8 @@ pub struct LoroDocInner {
     visible_op_count: Arc<AtomicUsize>,
     observer: Arc<Observer>,
     diff_calculator: Arc<LoroMutex<DiffCalculator>>,
+    // Serialized by the oplog lock; independent of retained undo trackers.
+    import_diff_calculator: std::sync::Mutex<DiffCalculator>,
     /// When dropping the doc, the txn will be committed
     ///
     /// # Internal Notes

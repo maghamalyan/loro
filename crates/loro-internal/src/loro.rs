@@ -157,6 +157,7 @@ impl LoroDoc {
                 detached: AtomicBool::new(false),
                 auto_commit: AtomicBool::new(false),
                 observer: Arc::new(Observer::new(arena.clone())),
+                import_diff_calculator: std::sync::Mutex::new(DiffCalculator::new_import()),
                 diff_calculator: Arc::new(
                     lock_group.new_lock(DiffCalculator::new(true), LockKind::DiffCalculator),
                 ),
@@ -712,15 +713,17 @@ impl LoroDoc {
             let old_frontiers = oplog.frontiers().clone();
             let result = f(&mut oplog);
             if &old_vv != oplog.vv() {
-                let mut diff = DiffCalculator::new(false);
-                let (diff, diff_mode) = diff.calc_diff_internal(
-                    &oplog,
-                    &old_vv,
-                    &old_frontiers,
-                    oplog.vv(),
-                    oplog.dag.get_frontiers(),
-                    None,
-                );
+                let (diff, diff_mode) = {
+                    let mut diff = self.import_diff_calculator.lock().unwrap();
+                    diff.calc_diff_internal(
+                        &oplog,
+                        &old_vv,
+                        &old_frontiers,
+                        oplog.vv(),
+                        oplog.dag.get_frontiers(),
+                        None,
+                    )
+                };
                 let mut state = self.state.lock();
                 if let Err(e) = state.apply_diff(
                     InternalDocDiff {
@@ -731,6 +734,7 @@ impl LoroDoc {
                     },
                     diff_mode,
                 ) {
+                    *self.import_diff_calculator.lock().unwrap() = DiffCalculator::new_import();
                     oplog.end_import_rollback(owns_rollback, false);
                     return Err(e);
                 }
@@ -832,7 +836,6 @@ impl LoroDoc {
 
         let result = encoding::apply_decoded_changes_to_oplog(&mut oplog, changes);
         if &old_vv != oplog.vv() {
-            let mut diff = DiffCalculator::new(false);
             // Applying may have unlocked pending changes; the isolated fast path is only valid
             // when exactly the candidate batch was appended on top of the old version.
             let isolated_batch = isolated_batch.filter(|(component_vv, _)| {
@@ -845,28 +848,31 @@ impl LoroDoc {
                         *end == old_end.max(component_end)
                     })
             });
-            let (diff, diff_mode) = if let Some((component_vv, _)) = isolated_batch {
-                #[cfg(test)]
-                ISOLATED_FAST_PATH_HITS.with(|hits| hits.set(hits.get() + 1));
-                let component_frontiers = oplog.dag.vv_to_frontiers(&component_vv);
-                let (diff, _) = diff.calc_diff_internal(
-                    &oplog,
-                    &VersionVector::default(),
-                    &Frontiers::default(),
-                    &component_vv,
-                    &component_frontiers,
-                    None,
-                );
-                (diff, DiffMode::Import)
-            } else {
-                diff.calc_diff_internal(
-                    &oplog,
-                    &old_vv,
-                    &old_frontiers,
-                    oplog.vv(),
-                    oplog.dag.get_frontiers(),
-                    None,
-                )
+            let (diff, diff_mode) = {
+                let mut diff = self.import_diff_calculator.lock().unwrap();
+                if let Some((component_vv, _)) = isolated_batch {
+                    #[cfg(test)]
+                    ISOLATED_FAST_PATH_HITS.with(|hits| hits.set(hits.get() + 1));
+                    let component_frontiers = oplog.dag.vv_to_frontiers(&component_vv);
+                    let (diff, _) = diff.calc_diff_internal(
+                        &oplog,
+                        &VersionVector::default(),
+                        &Frontiers::default(),
+                        &component_vv,
+                        &component_frontiers,
+                        None,
+                    );
+                    (diff, DiffMode::Import)
+                } else {
+                    diff.calc_diff_internal(
+                        &oplog,
+                        &old_vv,
+                        &old_frontiers,
+                        oplog.vv(),
+                        oplog.dag.get_frontiers(),
+                        None,
+                    )
+                }
             };
             let mut state = self.state.lock();
             if let Err(e) = state.apply_diff(
@@ -878,6 +884,7 @@ impl LoroDoc {
                 },
                 diff_mode,
             ) {
+                *self.import_diff_calculator.lock().unwrap() = DiffCalculator::new_import();
                 if rollback_enabled {
                     oplog.rollback_import();
                     return Err(e);
@@ -2516,6 +2523,7 @@ impl LoroDoc {
     /// Free the cached diff calculator that is used for checkout.
     pub fn free_diff_calculator(&self) {
         *self.diff_calculator.lock() = DiffCalculator::new(true);
+        *self.import_diff_calculator.lock().unwrap() = DiffCalculator::new_import();
     }
 
     /// Advances the retained text undo tracker without changing document state
@@ -3021,6 +3029,7 @@ impl BatchImportGuard<'_> {
                 // The shared diff calculator cached ranges against the rolled-back
                 // history; drop that cache instead of reusing stale entries.
                 *doc.diff_calculator.lock() = DiffCalculator::new(true);
+                *doc.import_diff_calculator.lock().unwrap() = DiffCalculator::new_import();
                 doc.set_detached(false);
             } else {
                 doc.oplog.lock().commit_import_rollback();

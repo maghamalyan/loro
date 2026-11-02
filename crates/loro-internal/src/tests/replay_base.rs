@@ -236,10 +236,14 @@ fn style_straddle_forks() -> (LoroDoc, LoroDoc, LoroDoc) {
         d.set_detached_editing(true);
         d.import(&snapshot).unwrap();
         d.set_peer_id(peer).unwrap();
+        d.get_text("t");
+        d.get_list("l");
         // Mid-change frontier: after StyleStart (counter 11), before
         // StyleEnd (counter 12).
         d.checkout(&Frontiers::from(ID::new(1, 11))).unwrap();
         d.set_peer_id(peer).unwrap();
+        d.get_text("t");
+        d.get_list("l");
         d.get_text("r").insert(2, s, PosType::Unicode).unwrap();
         d.commit_then_renew();
         forks.push(d);
@@ -691,4 +695,170 @@ fn selective_undo_preserves_later_overlapping_marks() {
             {"insert": "abcd"}, {"insert": "efg", "attributes": {"bold": "B"}}, {"insert": "hij"}
         ])
     );
+}
+
+/// Run with --release --ignored --nocapture incremental_import_benchmark.
+/// Setup and the first (cold) import are excluded; remote never sees local edits.
+#[test]
+#[ignore]
+fn incremental_import_benchmark() {
+    use std::time::Instant;
+    for retained in [false, true] {
+        for unseen in [0, 2_400, 10_000] {
+            let a = LoroDoc::new_auto_commit();
+            a.set_peer_id(1).unwrap();
+            let list = a.get_list("blocks");
+            let text = a.get_text("text");
+            for i in 0..5_000 {
+                list.insert(i, i as i64).unwrap();
+            }
+            text.insert_unicode(0, &"x".repeat(5_000)).unwrap();
+            a.commit_then_renew();
+            let b = a.fork();
+            b.set_peer_id(2).unwrap();
+            for i in 0..unseen {
+                list.insert((i * 7919) % list.len(), i as i64).unwrap();
+                text.insert_unicode((i * 7919) % text.len_unicode(), "l")
+                    .unwrap();
+                a.commit_then_renew();
+            }
+            let mut elapsed = std::time::Duration::ZERO;
+            for round in 0..51 {
+                b.get_list("blocks").insert(0, round as i64).unwrap();
+                b.get_text("text").insert_unicode(0, "r").unwrap();
+                b.commit_then_renew();
+                let update = b.export(ExportMode::updates(&a.oplog_vv())).unwrap();
+                if !retained {
+                    *a.import_diff_calculator.lock().unwrap() =
+                        crate::diff_calc::DiffCalculator::new(false);
+                }
+                let start = Instant::now();
+                a.import(&update).unwrap();
+                if round > 0 {
+                    elapsed += start.elapsed();
+                }
+            }
+            println!(
+                "retained={retained} unseen={unseen}: {:.3} ms/import (50 warm imports)",
+                elapsed.as_secs_f64() * 1000.0 / 50.0
+            );
+        }
+    }
+}
+
+#[test]
+fn incremental_import_matches_fresh_diffs_and_events() {
+    use crate::{cursor::PosType, diff_calc::DiffCalculator};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use std::sync::{Arc, Mutex};
+    let reused_before = crate::diff_calc::IMPORT_TRACKER_REUSE_COUNT.with(|c| c.get());
+    for seed in 0..12 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let docs: Vec<_> = (1..=3)
+            .map(|peer| {
+                let pair = [LoroDoc::new_auto_commit(), LoroDoc::new_auto_commit()];
+                for d in &pair {
+                    d.set_peer_id(peer).unwrap();
+                    d.get_text("t");
+                    d.get_list("l");
+                }
+                pair
+            })
+            .collect();
+        let events: Vec<_> = docs
+            .iter()
+            .map(|pair| {
+                pair.iter()
+                    .map(|d| {
+                        let events = Arc::new(Mutex::new(Vec::new()));
+                        let captured = events.clone();
+                        let sub = d.subscribe_root(Arc::new(move |e| {
+                            let mut diffs: Vec<_> =
+                                e.events.iter().map(|c| format!("{c:?}")).collect();
+                            diffs.sort();
+                            captured.lock().unwrap().push(format!(
+                                "{:?}/{:?}/{:?}/{:?}/{diffs:?}",
+                                e.event_meta.from,
+                                e.event_meta.to,
+                                e.event_meta.origin,
+                                e.event_meta.by
+                            ));
+                        }));
+                        (events, sub)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut calculators: Vec<_> = (0..3).map(|_| DiffCalculator::new_import()).collect();
+        for step in 0..300 {
+            let p = rng.gen_range(0..3);
+            if rng.gen_bool(0.4) {
+                let q = (p + rng.gen_range(1..3)) % 3;
+                let before = docs[p][0].oplog_vv();
+                let frontiers = docs[p][0].oplog_frontiers();
+                let bytes = docs[q][0].export(ExportMode::updates(&before)).unwrap();
+                // The oracle always imports with the original, uncached calculator.
+                *docs[p][1].import_diff_calculator.lock().unwrap() = DiffCalculator::new(false);
+                for d in &docs[p] {
+                    d.import(&bytes).unwrap();
+                    if step % 11 == 0 {
+                        d.import(&bytes).unwrap();
+                    }
+                }
+                let oplog = docs[p][0].oplog.lock();
+                let args = |calc: &mut DiffCalculator| {
+                    let (mut diff, mode) = calc.calc_diff_internal(
+                        &oplog,
+                        &before,
+                        &frontiers,
+                        oplog.vv(),
+                        oplog.frontiers(),
+                        None,
+                    );
+                    diff.sort_by_key(|d| d.idx);
+                    format!("{mode:?}/{diff:?}")
+                };
+                assert_eq!(
+                    args(&mut calculators[p]),
+                    args(&mut DiffCalculator::new(false)),
+                    "seed={seed} step={step}"
+                );
+            } else {
+                let len = docs[p][0].get_text("t").len_unicode();
+                let llen = docs[p][0].get_list("l").len();
+                let choice = rng.gen_range(0..5);
+                let pos = rng.gen_range(0..=len);
+                let lpos = rng.gen_range(0..=llen);
+                for d in &docs[p] {
+                    match choice {
+                        0 => d.get_text("t").insert_unicode(pos, "x🦀").unwrap(),
+                        1 if len > 0 => {
+                            d.get_text("t").delete_unicode(pos.min(len - 1), 1).unwrap()
+                        }
+                        2 if len > 0 => d
+                            .get_text("t")
+                            .mark(0, len, "bold", (step % 2 == 0).into(), PosType::Unicode)
+                            .unwrap(),
+                        3 => d.get_list("l").insert(lpos, step as i64).unwrap(),
+                        4 if llen > 0 => d.get_list("l").delete(lpos.min(llen - 1), 1).unwrap(),
+                        _ => {}
+                    }
+                    d.commit_then_renew();
+                }
+            }
+            for (i, pair) in docs.iter().enumerate() {
+                assert_eq!(pair[0].get_deep_value(), pair[1].get_deep_value());
+                assert_eq!(
+                    pair[0].get_text("t").get_richtext_value(),
+                    pair[1].get_text("t").get_richtext_value()
+                );
+                assert_eq!(
+                    *events[i][0].0.lock().unwrap(),
+                    *events[i][1].0.lock().unwrap(),
+                    "seed={seed} step={step}"
+                );
+            }
+        }
+    }
+    assert!(crate::diff_calc::IMPORT_TRACKER_REUSE_COUNT.with(|c| c.get()) > reused_before);
 }

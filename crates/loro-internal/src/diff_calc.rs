@@ -52,7 +52,6 @@ use super::{
 /// Calculate the diff between two versions. given [OpLog][super::oplog::OpLog]
 /// and [AppState][super::state::AppState].
 ///
-/// TODO: persist diffCalculator and skip processed version
 #[derive(Debug)]
 pub struct DiffCalculator {
     /// ContainerIdx -> (depth, calculator)
@@ -60,6 +59,15 @@ pub struct DiffCalculator {
     /// if depth is None, we need to calculate it again
     calculators: FxHashMap<ContainerIdx, (Option<NonZeroU16>, ContainerDiffCalculator)>,
     retain_mode: DiffCalculatorRetainMode,
+    import_cache: Option<ImportTrackerCache>,
+}
+
+/// Coverage is per container: unchanged containers need not have been visited in
+/// the preceding round. A matching critical base preserves the opaque prefix.
+#[derive(Debug, Default)]
+struct ImportTrackerCache {
+    base: Option<(VersionVector, DiffMode)>,
+    covered: FxHashMap<ContainerIdx, VersionVector>,
 }
 
 #[derive(Debug)]
@@ -136,12 +144,19 @@ impl DiffCalculator {
     pub fn new(persist: bool) -> Self {
         Self {
             calculators: Default::default(),
+            import_cache: None,
             retain_mode: if persist {
                 DiffCalculatorRetainMode::Persist
             } else {
                 DiffCalculatorRetainMode::Once { used: false }
             },
         }
+    }
+
+    pub(crate) fn new_import() -> Self {
+        let mut calc = Self::new(false);
+        calc.import_cache = Some(ImportTrackerCache::default());
+        calc
     }
 
     #[allow(unused)]
@@ -209,6 +224,24 @@ impl DiffCalculator {
             DiffCalculatorRetainMode::Persist => {
                 calc_mode = DiffMode::Checkout;
             }
+        }
+
+        // Keep the ordinary calculation modes (including the linear fast path).
+        // Only positional trackers with an identical seed can skip old ops.
+        let mut cache = self.import_cache.take();
+        if let Some(cache) = &mut cache {
+            let compatible = oplog.shallow_since_vv().is_empty()
+                && calc_mode != DiffMode::Linear
+                && cache
+                    .base
+                    .as_ref()
+                    .is_some_and(|(base, mode)| base == &replay_base && *mode == calc_mode)
+                && cache.covered.values().all(|vv| oplog.vv().includes_vv(vv));
+            if !compatible {
+                self.calculators.clear();
+                cache.covered.clear();
+            }
+            cache.base = Some((replay_base.clone(), calc_mode));
         }
 
         let affected_set = {
@@ -279,7 +312,32 @@ impl DiffCalculator {
                         } else {
                             calc_mode
                         };
-                        calculator.start_tracking(oplog, &replay_base, container_mode);
+                        if cache
+                            .as_ref()
+                            .is_some_and(|c| c.covered.contains_key(&container))
+                        {
+                            #[cfg(test)]
+                            IMPORT_TRACKER_REUSE_COUNT.with(|c| c.set(c.get() + 1));
+                            // No reseeding or checkout is needed: the first unseen op
+                            // supplies its own causal context below.
+                            match calculator {
+                                ContainerDiffCalculator::List(c) => {
+                                    c.source_not_in_op_context = false
+                                }
+                                ContainerDiffCalculator::Richtext(c) => {
+                                    if let RichtextCalcMode::Crdt {
+                                        source_not_in_op_context,
+                                        ..
+                                    } = &mut *c.mode
+                                    {
+                                        *source_not_in_op_context = false;
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            calculator.start_tracking(oplog, &replay_base, container_mode);
+                        }
                     }
 
                     // A change whose version misses part of `before` is being
@@ -303,6 +361,21 @@ impl DiffCalculator {
                         op.counter,
                         change.peer(),
                     );
+
+                    // Still visit old ops above to preserve source-context flags.
+                    // Slice at coverage boundaries, since a stored op can grow by RLE.
+                    let cached_slice;
+                    if let Some(covered) = cache.as_ref().and_then(|c| c.covered.get(&container)) {
+                        let end = covered.get(&change.peer()).copied().unwrap_or(0);
+                        if op.ctr_end() <= end {
+                            continue;
+                        }
+                        if op.counter < end {
+                            cached_slice = op.slice((end - op.counter) as usize, op.atom_len());
+                            op = &cached_slice;
+                            vv.extend_to_include_end_id(ID::new(change.peer(), end));
+                        }
+                    }
 
                     if calculator.ignores_ops_shared_by_both_versions() {
                         let op_id = ID::new(change.peer(), op.ctr_last());
@@ -336,6 +409,10 @@ impl DiffCalculator {
             // only visit the affected containers
             set.into_iter()
                 .map(|x| {
+                    if let Some(cache) = &mut cache {
+                        // Only visited containers have consumed this round's ops.
+                        cache.covered.insert(x, merged.clone());
+                    }
                     let (depth, _) = self.calculators.get_mut(&x).unwrap();
                     (*depth, x)
                 })
@@ -423,6 +500,22 @@ impl DiffCalculator {
             }
         }
 
+        if let Some(cache) = &mut cache {
+            self.calculators.retain(|idx, (_, calc)| {
+                let retain = calc_mode != DiffMode::Linear
+                    && oplog.shallow_since_vv().is_empty()
+                    && matches!(
+                        calc,
+                        ContainerDiffCalculator::List(_) | ContainerDiffCalculator::Richtext(_)
+                    );
+                if !retain {
+                    cache.covered.remove(idx);
+                }
+                retain
+            });
+        }
+        self.import_cache = cache;
+
         (
             ans.into_values().map(|x| x.1).collect_vec(),
             origin_diff_mode,
@@ -504,6 +597,7 @@ thread_local! {
     /// incremental path actually short-circuits them. Test observability
     /// only; thread-local so concurrently running tests cannot disturb each
     /// other's counts (diff calc runs on the importing thread).
+    pub(crate) static IMPORT_TRACKER_REUSE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub(crate) static FULL_TRACKER_REBUILD_COUNT: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
 }
