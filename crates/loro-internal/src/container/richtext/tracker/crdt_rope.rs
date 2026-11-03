@@ -1,11 +1,11 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BTreeMap};
 
 use generic_btree::{
     rle::{CanRemove, HasLength, Sliceable},
     BTree, BTreeTrait, Cursor, FindResult, LeafIndex, Query, SplittedLeaves,
 };
 use itertools::Itertools;
-use loro_common::{Counter, HasCounter, HasCounterSpan, HasIdSpan, IdSpan, Lamport, ID};
+use loro_common::{Counter, HasCounter, HasCounterSpan, IdSpan, Lamport, ID};
 use smallvec::{smallvec, SmallVec};
 
 use crate::container::richtext::{fugue_span::DiffStatus, FugueSpan, RichtextChunk, Status};
@@ -158,13 +158,23 @@ impl CrdtRope {
         if !in_between.is_empty() {
             // find insert pos
             let mut scanning = false;
-            let mut visited: SmallVec<[IdSpan; 4]> = Default::default();
+            // Rope leaves have disjoint id spans. The predecessor by (peer,
+            // counter) is the only visited span that can contain an origin.
+            let mut visited = BTreeMap::new();
             for (other_leaf, other_elem) in in_between.iter() {
                 // tracing::info!("Visiting {}", &other_elem.id);
                 let other_origin_left = other_elem.origin_left;
                 if other_origin_left != content.origin_left
                     && other_origin_left
-                        .map(|left| visited.iter().all(|x| !x.contains_id(left.to_id())))
+                        .map(|left| {
+                            let left = left.to_id();
+                            !visited
+                                .range(..=(left.peer, left.counter))
+                                .next_back()
+                                .is_some_and(|(&(peer, _), &end)| {
+                                    peer == left.peer && left.counter < end
+                                })
+                        })
                         .unwrap_or(true)
                 {
                     // The other_elem's origin_left must be at the left side of content's origin_left.
@@ -174,11 +184,10 @@ impl CrdtRope {
                     break;
                 }
 
-                visited.push(IdSpan::new(
-                    other_elem.id.peer,
-                    other_elem.id.counter,
+                visited.insert(
+                    (other_elem.id.peer, other_elem.id.counter),
                     other_elem.id.counter + other_elem.rle_len() as Counter,
-                ));
+                );
 
                 if content.origin_left == other_origin_left {
                     if other_elem.origin_right == content.origin_right {
@@ -735,6 +744,58 @@ mod test {
 
         span.status.delete_times += 1;
         span
+    }
+
+    #[test]
+    #[ignore]
+    fn visited_span_insert_benchmark() {
+        use std::time::Instant;
+
+        let mut rope = CrdtRope::new();
+        let right = CompactId::new(0, 0);
+        let mut left = None;
+        // Gaps in counters prevent RLE merging, as when text and list ops
+        // alternate. Each origin is in the last span visited by the scan.
+        for i in 0..6_250 {
+            let mut item = FugueSpan::new(
+                IdFull::new(1, i * 2, i as Lamport * 2 + 1),
+                RichtextChunk::new_text(0..1),
+            );
+            item.status.future = true;
+            item.origin_left = left;
+            item.origin_right = Some(right);
+            left = Some(CompactId::new(1, i * 2));
+            rope.tree.push(item);
+        }
+        rope.tree.push(span(0, 0..1));
+
+        let mut samples = Vec::new();
+        for round in 0..101 {
+            let mut sample = rope.clone();
+            let start = Instant::now();
+            let inserted = sample.insert(0, span(2, 0..1), |_| unreachable!());
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            if round > 0 {
+                samples.push(elapsed);
+            }
+            let before = sample
+                .tree
+                .prev_elem(Cursor {
+                    leaf: inserted.leaf,
+                    offset: 0,
+                })
+                .unwrap();
+            assert_eq!(
+                sample.tree.get_elem(before.leaf).unwrap().id.id(),
+                left.unwrap().to_id()
+            );
+            assert_eq!(sample.len(), 2);
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "spans=6250 samples=100 p50={:.3}ms p99={:.3}ms",
+            samples[49], samples[98]
+        );
     }
 
     #[test]

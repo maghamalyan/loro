@@ -228,7 +228,19 @@ impl DiffCalculator {
 
         // Keep the ordinary calculation modes (including the linear fast path).
         // Only positional trackers with an identical seed can skip old ops.
-        let mut cache = self.import_cache.take();
+        // Causally greater imports can move the replay base, and Linear text
+        // calculation replaces its tracker with a delta builder. Use temporary
+        // calculators and leave retained coverage unchanged: a later compatible
+        // replay will consume the intervening ops.
+        let retained_forward = (self.import_cache.is_some()
+            && (calc_mode == DiffMode::Linear
+                || (calc_mode == DiffMode::ImportGreaterUpdates && !self.calculators.is_empty())))
+        .then(|| std::mem::take(&mut self.calculators));
+        let mut cache = if retained_forward.is_some() {
+            None
+        } else {
+            self.import_cache.take()
+        };
         if let Some(cache) = &mut cache {
             let compatible = oplog.shallow_since_vv().is_empty()
                 && calc_mode != DiffMode::Linear
@@ -514,7 +526,11 @@ impl DiffCalculator {
                 retain
             });
         }
-        self.import_cache = cache;
+        if let Some(calculators) = retained_forward {
+            self.calculators = calculators;
+        } else {
+            self.import_cache = cache;
+        }
 
         (
             ans.into_values().map(|x| x.1).collect_vec(),
@@ -2717,4 +2733,196 @@ fn persisted_walk_does_not_duplicate_style_entries() {
     };
     let ids = text.tracked_style_ids();
     assert_eq!(ids.len(), marks, "duplicate style entries: {ids:?}");
+}
+
+#[test]
+#[ignore]
+fn visited_span_import_benchmark() {
+    use crate::{loro::ExportMode, LoroDoc};
+    use std::time::Instant;
+
+    for cold in [true, false] {
+        let writer = LoroDoc::new_auto_commit();
+        writer.set_peer_id(1).unwrap();
+        for i in 0..5_000 {
+            writer.get_list("l").insert(i, i as i64).unwrap();
+        }
+        writer
+            .get_text("t")
+            .insert_unicode(0, &"x".repeat(5_000))
+            .unwrap();
+        writer.commit_then_renew();
+        let remote = writer.fork();
+        remote.set_peer_id(2).unwrap();
+        for i in 0..10_000 {
+            let list = writer.get_list("l");
+            list.insert(i, i as i64).unwrap();
+            let text = writer.get_text("t");
+            text.insert_unicode(i, "l").unwrap();
+            writer.commit_then_renew();
+        }
+        let validation = LoroDoc::new_auto_commit();
+        validation
+            .import(&writer.export(ExportMode::Snapshot).unwrap())
+            .unwrap();
+        let mut samples = Vec::new();
+        for round in 0..101 {
+            remote.get_list("l").insert(0, round as i64).unwrap();
+            remote.get_text("t").insert_unicode(0, "r").unwrap();
+            remote.commit_then_renew();
+            let update = remote
+                .export(ExportMode::updates(&validation.oplog_vv()))
+                .unwrap();
+            if cold {
+                *validation.import_diff_calculator.lock().unwrap() = DiffCalculator::new_import();
+            }
+            let start = Instant::now();
+            validation.import(&update).unwrap();
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            if round > 0 {
+                samples.push(elapsed);
+            }
+            if !cold {
+                writer.import(&update).unwrap();
+                writer.get_list("l").insert(0, round as i64).unwrap();
+                writer.get_text("t").insert_unicode(0, "a").unwrap();
+                writer.commit_then_renew();
+                validation
+                    .import(
+                        &writer
+                            .export(ExportMode::updates(&validation.oplog_vv()))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(validation.get_deep_value(), writer.get_deep_value());
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "cold={cold} unseen=10000 samples=100 p50={:.3}ms p99={:.3}ms",
+            samples[49], samples[98]
+        );
+    }
+}
+
+#[test]
+fn import_trackers_survive_linear_rounds() {
+    use crate::{cursor::PosType, loro::ExportMode, LoroDoc};
+
+    let writer = LoroDoc::new_auto_commit();
+    writer.set_peer_id(1).unwrap();
+    writer.get_text("t").insert_unicode(0, "seed🦀").unwrap();
+    writer.get_list("l").insert(0, 0).unwrap();
+    writer.commit_then_renew();
+    let remote = writer.fork();
+    remote.set_peer_id(2).unwrap();
+    for i in 0..64 {
+        writer.get_text("t").insert_unicode(i, "x").unwrap();
+        writer.get_list("l").insert(i, i as i64).unwrap();
+        writer.commit_then_renew();
+    }
+    let pair = [LoroDoc::new_auto_commit(), LoroDoc::new_auto_commit()];
+    let snapshot = writer.export(ExportMode::Snapshot).unwrap();
+    for doc in &pair {
+        doc.import(&snapshot).unwrap();
+    }
+    let import = |bytes: &[u8]| {
+        *pair[1].import_diff_calculator.lock().unwrap() = DiffCalculator::new(false);
+        for doc in &pair {
+            doc.import(bytes).unwrap();
+        }
+        assert_eq!(pair[0].get_deep_value(), pair[1].get_deep_value());
+        assert_eq!(
+            pair[0].get_text("t").get_richtext_value(),
+            pair[1].get_text("t").get_richtext_value()
+        );
+    };
+    let reused_before = IMPORT_TRACKER_REUSE_COUNT.with(|c| c.get());
+    for round in 0..6 {
+        remote.get_text("t").insert_unicode(0, "r").unwrap();
+        remote.get_list("l").insert(0, round).unwrap();
+        remote.commit_then_renew();
+        let bytes = remote
+            .export(ExportMode::updates(&pair[0].oplog_vv()))
+            .unwrap();
+        import(&bytes);
+        writer.import(&bytes).unwrap();
+        let (base, covered) = {
+            let calc = pair[0].import_diff_calculator.lock().unwrap();
+            assert_eq!(calc.calculators.len(), 2);
+            let cache = calc.import_cache.as_ref().unwrap();
+            (cache.base.clone(), cache.covered.clone())
+        };
+        for step in 0..4 {
+            let before = pair[0].oplog_vv();
+            let frontiers = pair[0].oplog_frontiers();
+            match step {
+                0 => writer.get_text("t").insert_unicode(1, "🦀a").unwrap(),
+                1 => writer.get_list("l").delete(1, 1).unwrap(),
+                2 => writer
+                    .get_text("t")
+                    .mark(0, 3, "bold", (round % 2 == 0).into(), PosType::Unicode)
+                    .unwrap(),
+                _ => writer.get_map("m").insert("round", round).unwrap(),
+            }
+            writer.commit_then_renew();
+            import(&writer.export(ExportMode::updates(&before)).unwrap());
+            let oplog = pair[0].oplog.lock();
+            let (replay, _) = oplog.iter_from_replay_base_causally(
+                &before,
+                &frontiers,
+                oplog.vv(),
+                oplog.frontiers(),
+            );
+            assert_eq!(
+                replay.diff_mode,
+                if step == 0 {
+                    DiffMode::ImportGreaterUpdates
+                } else {
+                    DiffMode::Linear
+                },
+                "round={round} step={step}"
+            );
+            let calc = pair[0].import_diff_calculator.lock().unwrap();
+            let cache = calc.import_cache.as_ref().unwrap();
+            assert_eq!(cache.base, base);
+            assert_eq!(cache.covered, covered);
+            assert_eq!(calc.calculators.len(), 2);
+        }
+    }
+    assert!(IMPORT_TRACKER_REUSE_COUNT.with(|c| c.get()) >= reused_before + 10);
+
+    // A new critical base must still invalidate the old opaque prefix.
+    let old_base = pair[0]
+        .import_diff_calculator
+        .lock()
+        .unwrap()
+        .import_cache
+        .as_ref()
+        .unwrap()
+        .base
+        .clone();
+    remote
+        .import(
+            &writer
+                .export(ExportMode::updates(&remote.oplog_vv()))
+                .unwrap(),
+        )
+        .unwrap();
+    writer.get_text("t").insert_unicode(0, "local").unwrap();
+    writer.commit_then_renew();
+    import(
+        &writer
+            .export(ExportMode::updates(&pair[0].oplog_vv()))
+            .unwrap(),
+    );
+    remote.get_text("t").insert_unicode(0, "remote").unwrap();
+    remote.commit_then_renew();
+    import(
+        &remote
+            .export(ExportMode::updates(&pair[0].oplog_vv()))
+            .unwrap(),
+    );
+    let calc = pair[0].import_diff_calculator.lock().unwrap();
+    assert_ne!(calc.import_cache.as_ref().unwrap().base, old_base);
 }
