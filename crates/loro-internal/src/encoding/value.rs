@@ -637,7 +637,7 @@ impl<'a> ValueReader<'a> {
                 for i in 0..len {
                     ans.push(self.recursive_read_value_type_and_content(keys, id.inc(i as i32))?);
                 }
-                ans.into()
+                LoroValue::List(ans.into())
             }
             LoroValueKind::Map => {
                 let len = self.read_usize()?;
@@ -654,7 +654,7 @@ impl<'a> ValueReader<'a> {
                     let value = self.recursive_read_value_type_and_content(keys, id)?;
                     ans.insert(key, value);
                 }
-                ans.into()
+                LoroValue::Map(ans.into())
             }
             LoroValueKind::Binary => LoroValue::Binary(self.read_binary()?.to_owned().into()),
             LoroValueKind::ContainerType => {
@@ -714,13 +714,15 @@ impl<'a> ValueReader<'a> {
 
             fn into_value(self) -> LoroValue {
                 match self {
-                    Self::ReadList { vec, .. } => vec.into(),
-                    Self::ReadMap { map, .. } => map.into(),
+                    Self::ReadList { vec, .. } => LoroValue::List(vec.into()),
+                    Self::ReadMap { map, .. } => LoroValue::Map(map.into()),
                     _ => unreachable!(),
                 }
             }
         }
-        let mut stack = vec![Task::Init];
+        // Most values are shallow; retain heap growth for deeply nested input.
+        let mut stack = smallvec::SmallVec::<[Task; 4]>::new();
+        stack.push(Task::Init);
         while let Some(mut task) = stack.pop() {
             if task.should_read() {
                 let key_idx = if matches!(task, Task::ReadMap { .. }) {
@@ -1157,6 +1159,102 @@ mod tests {
     use super::*;
     use crate::{container::tree::tree_op::TreeOp, fx_map};
 
+    fn event_value(i: i64) -> LoroValue {
+        fx_map!(
+            "kind".to_string() => "write".into(),
+            "actor".to_string() => "remote-peer".into(),
+            "register".to_string() => "document/title".into(),
+            "sequence".to_string() => i.into(),
+            "timestamp".to_string() => (i + 1_000_000).into(),
+            "parents".to_string() => vec![i, i + 1, i + 2].into(),
+            "payload".to_string() => fx_map!("text".to_string() => "hello world".into()).into()
+        )
+        .into()
+    }
+
+    fn report_times(name: &str, mut samples: Vec<std::time::Duration>) {
+        samples.sort_unstable();
+        eprintln!(
+            "{name}: p50={:.3} ms p99={:.3} ms n={}",
+            samples[samples.len() / 2].as_secs_f64() * 1000.0,
+            samples[(samples.len() * 99 / 100).min(samples.len() - 1)].as_secs_f64() * 1000.0,
+            samples.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "release value allocation and import benchmark"]
+    fn value_decode_budget() {
+        use crate::{encoding::ExportMode, LoroDoc};
+        use std::{hint::black_box, time::Instant};
+
+        for (name, value) in [
+            ("int", 123_i64.into()),
+            ("string", "hello world".into()),
+            ("list", vec![1_i64, 2, 3].into()),
+            ("map", event_value(42)),
+        ] {
+            let mut writer = ValueWriter::new();
+            let mut registers = TestRegisters::default();
+            writer.write_value_type_and_content(&value, &mut registers);
+            let bytes = writer.finish();
+            let keys = registers.key.unwrap_vec();
+            let decode = || {
+                ValueReader::new(&bytes)
+                    .read_value_type_and_content(&keys, ID::new(1, 0))
+                    .unwrap()
+            };
+            assert_eq!(decode(), value);
+            let mut samples = Vec::new();
+            for _ in 0..100 {
+                let start = Instant::now();
+                let values: Vec<_> = (0..10_000).map(|_| black_box(decode())).collect();
+                samples.push(start.elapsed());
+                black_box(values);
+            }
+            report_times(name, samples);
+        }
+
+        let source = LoroDoc::new_auto_commit();
+        source.set_peer_id(1).unwrap();
+        source.set_change_merge_interval(-1);
+        let list = source.get_list("events");
+        for i in 0..10_000 {
+            list.insert(i, event_value(i as i64)).unwrap();
+            source.commit_then_renew();
+        }
+        assert_eq!(source.oplog().lock().len_changes(), 10_000);
+        let bytes = source.export(ExportMode::all_updates()).unwrap();
+        eprintln!("update bytes={}", bytes.len());
+        for detached in [true, false] {
+            let mut samples = Vec::new();
+            for sample in 0..105 {
+                let target = LoroDoc::new_auto_commit();
+                if detached {
+                    target.detach();
+                }
+                let start = Instant::now();
+                target.import(black_box(&bytes)).unwrap();
+                let elapsed = start.elapsed();
+                if sample >= 5 {
+                    samples.push(elapsed);
+                }
+                if !detached && sample == 0 {
+                    assert_eq!(target.get_deep_value(), source.get_deep_value());
+                }
+                black_box(target);
+            }
+            report_times(
+                if detached {
+                    "detached import"
+                } else {
+                    "attached import"
+                },
+                samples,
+            );
+        }
+    }
+
     #[derive(Default)]
     struct TestRegisters {
         key: ValueRegister<InternalString>,
@@ -1493,6 +1591,83 @@ mod tests {
             .read_value_type_and_content(&keys, ID::new(7, 2))
             .unwrap();
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn nested_values_randomized_roundtrip() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        fn value(rng: &mut StdRng, depth: usize) -> LoroValue {
+            match rng.gen_range(0..if depth == 0 { 7 } else { 9 }) {
+                0 => LoroValue::Null,
+                1 => rng.gen::<bool>().into(),
+                2 => rng.gen::<i64>().into(),
+                3 => LoroValue::Double(f64::from_bits(rng.gen())),
+                4 => "".into(),
+                5 => format!("text-{}-é🦀", rng.gen::<u32>()).into(),
+                6 => (0..rng.gen_range(0..16))
+                    .map(|_| rng.gen::<u8>())
+                    .collect::<Vec<_>>()
+                    .into(),
+                7 => LoroValue::List(
+                    (0..rng.gen_range(0..5))
+                        .map(|_| value(rng, depth - 1))
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                _ => (0..rng.gen_range(0..5))
+                    .map(|i| (format!("key-{i}"), value(rng, depth - 1)))
+                    .collect::<FxHashMap<_, _>>()
+                    .into(),
+            }
+        }
+
+        let mut rng = StdRng::seed_from_u64(0xdec0de);
+        for _ in 0..2_000 {
+            let original = value(&mut rng, 8);
+            let mut writer = ValueWriter::new();
+            let mut registers = TestRegisters::default();
+            writer.write_value_type_and_content(&original, &mut registers);
+            let keys = registers.key.unwrap_vec();
+            let bytes = writer.finish();
+            let mut reader = ValueReader::new(&bytes);
+            assert_eq!(
+                reader
+                    .read_value_type_and_content(&keys, ID::new(1, 0))
+                    .unwrap(),
+                original
+            );
+            assert!(reader.raw.is_empty());
+        }
+    }
+
+    #[test]
+    fn deep_value_stack_growth_and_truncation() {
+        let mut value = LoroValue::I64(42);
+        for _ in 0..64 {
+            value = vec![
+                LoroValue::Null,
+                fx_map!("child".to_string() => value).into(),
+            ]
+            .into();
+        }
+        let mut writer = ValueWriter::new();
+        let mut registers = TestRegisters::default();
+        writer.write_value_type_and_content(&value, &mut registers);
+        let keys = registers.key.unwrap_vec();
+        let bytes = writer.finish();
+        assert_eq!(
+            ValueReader::new(&bytes)
+                .read_value_type_and_content(&keys, ID::new(1, 0))
+                .unwrap(),
+            value
+        );
+        for end in 0..bytes.len() {
+            assert!(matches!(
+                ValueReader::new(&bytes[..end]).read_value_type_and_content(&keys, ID::new(1, 0)),
+                Err(LoroError::DecodeDataCorruptionError)
+            ));
+        }
     }
 
     #[test]
